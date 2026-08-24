@@ -259,9 +259,13 @@ immediately rather than surfacing later as a confusing analysis result.
 
 ## Dashboard
 
-<!-- If deploying publicly, put the link here. -->
+**Link:** <http://localhost:8050> — served by `make dashboard`.
 
-Run locally with `make dashboard`, then open port 8050.
+> **TODO before submitting:** if the dashboard is deployed publicly, replace the
+> link above with the hosted URL.
+
+In Codespaces the port is forwarded automatically: run `make dashboard`, then
+click **Open in Browser** on the notification, or use the **Ports** tab.
 
 The dashboard has one tab per part, selected from the bar along the bottom of
 the screen:
