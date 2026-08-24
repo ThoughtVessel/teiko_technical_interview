@@ -261,9 +261,6 @@ immediately rather than surfacing later as a confusing analysis result.
 
 **Link:** <http://localhost:8050> — served by `make dashboard`.
 
-> **TODO before submitting:** if the dashboard is deployed publicly, replace the
-> link above with the hosted URL.
-
 In Codespaces the port is forwarded automatically: run `make dashboard`, then
 click **Open in Browser** on the notification, or use the **Ports** tab.
 
