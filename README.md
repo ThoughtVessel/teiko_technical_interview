@@ -1,6 +1,8 @@
 # Teiko Technical Interview
 
-<!-- One or two sentences: what this repo contains and what the assignment was. -->
+Analysis of immune cell population counts from a clinical trial dataset:
+a SQLite schema and loader, the frequency and statistical analyses, and an
+interactive dashboard presenting the results.
 
 ## Setup and Usage
 
@@ -15,10 +17,11 @@ make dashboard   # start the dashboard server
 ### Requirements
 
 - Python 3.9 or newer.
-- `make setup` installs the packages in `requirements.txt` (`dash`, `plotly`,
-  `pandas`). These are needed only by the dashboard.
-- The pipeline itself is standard-library only, so `make pipeline` reproduces
-  every output file even if `make setup` has not been run.
+- `make setup` installs the packages in `requirements.txt`: `scipy` and
+  `matplotlib` for the Part 3 statistics and boxplot, and `dash`, `plotly` and
+  `pandas` for the dashboard.
+- Run `make setup` before `make pipeline`. Parts 1 and 2 need only the standard
+  library, but Part 3 does not.
 
 The `Makefile` invokes `python3`, which exists in Codespaces and on macOS
 alike. Override it if your environment differs:
@@ -57,7 +60,13 @@ It produces two things:
 | Path | Contents |
 | --- | --- |
 | `cell_count.db` | SQLite database, in the repository root |
-| `outputs/cell_frequencies.csv` | Part 2 summary table, 52,500 rows |
+| `outputs/cell_frequencies.csv` | Part 2: frequency summary table, 52,500 rows |
+| `outputs/part3_responder_stats.csv` | Part 3: per-population test results |
+| `outputs/part3_responder_stats_baseline.csv` | Part 3: baseline-only sensitivity analysis |
+| `outputs/part3_boxplot.png` | Part 3: responder vs non-responder boxplot |
+| `outputs/part4_baseline_samples.csv` | Part 4: the 656 filtered baseline samples |
+| `outputs/part4_summary.csv` | Part 4: project, response and sex breakdowns |
+| `outputs/part4_b_cell_average.csv` | Part 4: average B cell count answer |
 
 The load is idempotent: every run drops and rebuilds the tables, so repeated
 runs are safe and always yield the same database.
@@ -106,33 +115,116 @@ to regenerate them.
 
 ## Database Schema
 
-<!-- Diagram or table listing the three tables and their columns. -->
+Three tables, defined in `load_data.py`:
+
+```
+project                subject                        sample
+-------                -------                        ------
+project_id (PK)        subject_id (PK)                sample_id (PK)
+                       condition                      subject_id (FK -> subject)
+                       age                            project_id (FK -> project)
+                       sex                            sample_type
+                       treatment                      time_from_treatment_start
+                       response                       b_cell
+                                                      cd8_t_cell
+                                                      cd4_t_cell
+                                                      nk_cell
+                                                      monocyte
+```
+
+| Table | Rows | Grain |
+| --- | --- | --- |
+| `project` | 3 | one study |
+| `subject` | 3,500 | one patient |
+| `sample` | 10,500 | one specimen |
 
 ### Design rationale
 
-<!-- Why three tables: project, subject, sample.
-     - What functional dependencies were verified against the CSV, and how.
-     - Why project is referenced from sample rather than subject.
-     - Why response sits on subject (best overall response = one endpoint per patient).
-     - Why cell counts are stored wide rather than long, and what that trades away.
-     - What the CHECK constraints and the UNIQUE constraint each protect against. -->
+**The split is driven by verified functional dependencies, not by eye.**
+Before writing any DDL, `profile_data.py` checked every candidate dependency
+against all 10,500 rows. `subject` determines `condition`, `age`, `sex`,
+`treatment` and `response` with zero violations, so those columns move to a
+`subject` table without losing information. In the flat CSV they are
+transitively dependent on the key (`sample -> subject -> sex`), which is a
+2NF violation; splitting them out brings the model to 3NF.
+
+**A dependency that holds is not always one worth modelling.** `subject` also
+determines `sample_type` in this dataset — every patient's three specimens are
+all PBMC or all whole blood. That is an artefact of how the data was generated,
+not a clinical fact: PBMC versus whole blood is a property of the specimen and
+the assay, and drawing both from one patient must not break the schema. It
+stays on `sample` deliberately. Functional dependency tests describe the
+snapshot in front of you, not the domain.
+
+**`project` is referenced from `sample`.** A project is a data collection
+effort, so it attaches naturally to the specimen. Hanging it off `subject`
+instead would assert that a patient belongs to exactly one study forever;
+referencing it from `sample` leaves room for a patient enrolled in a second
+study later.
+
+**`response` sits on `subject` as a best overall response** — one trial
+endpoint per patient, NULL for the 474 untreated subjects. The alternative
+reading is that response is assessed per visit and can change between them, in
+which case it belongs on `sample`. The data cannot distinguish the two: response
+is constant within every subject here. The endpoint reading was chosen because
+it keeps `treatment` and `response` together, and because a per-visit column on
+`sample` would be partially dependent on the `(subject, timepoint)` candidate
+key and could store contradictory values for two specimens drawn on the same day.
+
+**Cell counts are stored wide**, as five columns on `sample`. This keeps the
+model at three tables and mirrors the source file. It is the design's weakest
+point: see below.
+
+**Constraints encode what was verified.** `CHECK` constraints pin the
+categorical vocabularies, and `UNIQUE (subject_id, sample_type,
+time_from_treatment_start)` rejects duplicate specimens — a constraint that was
+confirmed to hold across all 10,500 rows before being declared.
 
 ### Scaling considerations
 
-<!-- Hundreds of projects, thousands of samples, varied analytics:
-     - Where the current design holds up and where it strains first.
-     - Indexing strategy for the common query shapes.
-     - The wide-vs-long cell count question at scale (adding a sixth population).
-     - When to split treatment into its own table (multi-line therapy).
-     - When SQLite stops being the right choice, and what replaces it. -->
+**What holds up.** The three-table split scales cleanly in the row dimension.
+`sample` grows linearly, `subject` and `project` stay small, and the foreign
+keys keep joins cheap. Indexes already exist on `subject_id`, `project_id` and
+`time_from_treatment_start`, which cover the cohort filters every analysis here
+performs. At hundreds of projects and hundreds of thousands of samples, a
+composite index on the common filter shape — condition, treatment, sample type,
+timepoint — would be the next addition.
+
+**What strains first: the wide cell count columns.** Adding a sixth population
+means an `ALTER TABLE`, a schema migration, a loader change and an edit to every
+query that names the five columns. A long `cell_count(sample_id, population,
+count)` table would make that an `INSERT`, let panels differ between projects,
+and turn the frequency query into a `GROUP BY` instead of five hand-written
+column references. With hundreds of projects running different panels, the wide
+form stops working: projects would need columns they do not measure. The long
+form is the first change to make.
+
+**Second: treatment.** `treatment` on `subject` asserts one therapy per patient
+for all time. Second-line therapy or a crossover arm breaks it. The fix is a
+`treatment_episode` table between subject and sample, carrying the drug,
+the response endpoint and the treatment start date that
+`time_from_treatment_start` is measured against. It is declined here because it
+buys nothing against this dataset, where every subject has exactly one drug.
+
+**Third: the categorical `CHECK` constraints.** Hardcoded drug and condition
+vocabularies catch typos at load time, but a fourth drug means a migration. At
+scale they become lookup tables with foreign keys.
+
+**When SQLite stops being right.** SQLite is a good fit here: a single-writer,
+read-mostly analytical dataset that a grader can rebuild in seconds with no
+server. It stops fitting when several projects need to load concurrently, since
+SQLite serialises writers. At that point Postgres is the natural move. If the
+workload stays analytical but the row count grows past tens of millions, a
+columnar engine such as DuckDB would serve the aggregate-heavy queries better
+than either, while keeping the same SQL.
 
 ## Code Structure
 
 | File | Role |
 | --- | --- |
 | `load_data.py` | Part 1: defines the schema and loads `cell-count.csv` into `cell_count.db` |
-| `analysis.py` | Analysis queries; Part 2 is a single SQL statement |
-| `run_analysis.py` | Runs each part in turn and writes the results to `outputs/` |
+| `analysis.py` | Queries and statistics for Parts 2-4 |
+| `run_analysis.py` | Runs each part in turn and writes results and plots to `outputs/` |
 | `app.py` | Dash dashboard, one tab per part |
 | `profile_data.py` | Standalone data profiler used to verify the functional dependencies behind the schema |
 | `Makefile` | `setup`, `pipeline`, `dashboard`, `clean` targets |
@@ -142,15 +234,42 @@ to regenerate them.
 
 ### Design decisions
 
-<!-- Why it is laid out this way:
-     - Stdlib-only, no dependency install step for the reviewer.
-     - Paths resolved from __file__ so it runs from any working directory.
-     - Idempotent rebuild rather than incremental load.
-     - Separation of read / transform / load, and why that is testable.
-     - Part 2 computed in SQL, so the CSV and the dashboard cannot disagree.
-     - Pipeline is stdlib-only; only the dashboard needs installed packages.
-     - The post-load verification summary and what it proves. -->
+**Data and presentation are separated.** `analysis.py` returns plain Python
+data structures and knows nothing about files, figures or HTML. `run_analysis.py`
+writes CSVs and renders the boxplot; `app.py` renders the dashboard. Both
+consume the same functions, so the generated files and the dashboard cannot
+report different numbers — a class of bug that is otherwise easy to ship and
+hard to notice.
+
+**Filtering and aggregation live in SQL.** The database is the single definition
+of each cohort. Only the hypothesis tests are done in Python, where SQLite has
+nothing useful to offer.
+
+**Scripts take no arguments and resolve their own paths** from `__file__`, so
+they behave identically whether run by `make`, by a grader, or from another
+directory.
+
+**The load is idempotent.** Every run drops and rebuilds the tables rather than
+appending, so re-running is always safe and the database is a pure function of
+the CSV.
+
+**The loader verifies itself.** After loading it prints per-table row counts and
+runs `PRAGMA foreign_key_check`, so a failed or partial load is visible
+immediately rather than surfacing later as a confusing analysis result.
 
 ## Dashboard
 
-<!-- Link goes here, plus a sentence on what it shows. -->
+<!-- If deploying publicly, put the link here. -->
+
+Run locally with `make dashboard`, then open port 8050.
+
+The dashboard has one tab per part, selected from the bar along the bottom of
+the screen:
+
+- **Part 2** — every sample and population, sortable and paginated, with a
+  search box that filters by sample ID.
+- **Part 3** — the responder comparison: cohort size, an interactive boxplot,
+  the full test results, and a plain statement of what is and is not
+  significant.
+- **Part 4** — the baseline cohort with its project, response and sex
+  breakdowns, the average B cell count, and the underlying sample list.
